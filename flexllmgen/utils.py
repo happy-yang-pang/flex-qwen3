@@ -29,6 +29,10 @@ class Task:
     do_sample: bool
     temperature: float
     stop: Optional[int]
+    repetition_penalty: float = 1.0
+    no_repeat_ngram_size: int = 0
+    top_p: float = 1.0
+    top_k: int = 0
 
 
 @dataclasses.dataclass(frozen=True)

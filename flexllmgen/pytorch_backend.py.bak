@@ -13,21 +13,6 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
-DEBUG_DUMP_ENABLED = False
-DEBUG_DUMP_DIR = None
-DEBUG_DUMP_LAYER = 0
-DEBUG_DUMP_DONE = set()
-
-
-def set_debug_dump(enabled=False, dump_dir=None, layer=0):
-    global DEBUG_DUMP_ENABLED, DEBUG_DUMP_DIR, DEBUG_DUMP_LAYER, DEBUG_DUMP_DONE
-    DEBUG_DUMP_ENABLED = enabled
-    DEBUG_DUMP_DIR = dump_dir
-    DEBUG_DUMP_LAYER = layer
-    if enabled and dump_dir:
-        os.makedirs(dump_dir, exist_ok=True)
-    DEBUG_DUMP_DONE = set()
-
 from flexllmgen.utils import (GB, T, cpu_mem_stats, vector_gather,
     np_dtype_to_torch_dtype, torch_dtype_to_np_dtype,
     torch_dtype_to_num_bytes)
@@ -42,53 +27,6 @@ def fix_recursive_import():
     from flexllmgen import compression
     general_copy_compressed = compression.general_copy_compressed
     TorchCompressedDevice = compression.TorchCompressedDevice
-
-
-def rms_norm(x, weight, eps=1e-6):
-    # Match HF behavior more closely: normalize and scale in fp32, cast at end.
-    x_fp32 = x.float()
-    w_fp32 = weight.float()
-    variance = x_fp32.pow(2).mean(dim=-1, keepdim=True)
-    x_norm = x_fp32 * torch.rsqrt(variance + eps)
-    out = x_norm * w_fp32
-    return out.to(dtype=x.dtype)
-
-
-def apply_rope(x, positions, theta=1_000_000.0):
-    # x: (b, s, n_head, head_dim)
-    # Qwen/Llama-style rotate_half (split last dim into two contiguous halves).
-    head_dim = x.shape[-1]
-    half_dim = head_dim // 2
-    inv_freq = 1.0 / (theta ** (torch.arange(0, half_dim, device=x.device, dtype=torch.float32) / half_dim))
-    freqs = torch.einsum("bs,d->bsd", positions.float(), inv_freq)
-    cos = freqs.cos().unsqueeze(2).to(dtype=x.dtype)
-    sin = freqs.sin().unsqueeze(2).to(dtype=x.dtype)
-
-    x1 = x[..., :half_dim]
-    x2 = x[..., half_dim:]
-    out1 = x1 * cos - x2 * sin
-    out2 = x1 * sin + x2 * cos
-    return torch.cat([out1, out2], dim=-1)
-
-
-def _to_np(x):
-    if isinstance(x, torch.Tensor):
-        return x.detach().float().cpu().numpy()
-    return np.asarray(x)
-
-
-def maybe_dump_debug(tag, layer_id=None, **kwargs):
-    if not DEBUG_DUMP_ENABLED or DEBUG_DUMP_DIR is None:
-        return
-    if layer_id is not None and layer_id != DEBUG_DUMP_LAYER:
-        return
-    full_tag = f"{tag}_layer{layer_id}" if layer_id is not None else tag
-    if full_tag in DEBUG_DUMP_DONE:
-        return
-    data = {k: _to_np(v) for k, v in kwargs.items()}
-    out_path = os.path.join(DEBUG_DUMP_DIR, f"{full_tag}.npz")
-    np.savez(out_path, **data)
-    DEBUG_DUMP_DONE.add(full_tag)
 
 
 class DeviceType(Enum):
@@ -261,16 +199,16 @@ class TorchDevice:
 
         if not policy.compress_cache:
             b = policy.gpu_batch_size
-            n_kv_head = getattr(config, "n_kv_head", config.n_head)
-            # Qwen3 uses explicit head_dim (e.g. 128) which may differ from input_dim // n_head.
-            head_dim = getattr(config, "head_dim", config.input_dim // config.n_head)
+            n_head = config.n_head
+            head_dim = config.input_dim // n_head
             max_seq_len = task.prompt_len + task.gen_len - 1
             self.attention_compute_workspace = []
             self.workspace_pt = 0
 
-            # Workspace should follow KV-cache layout: (s, b * n_kv_head, head_dim)
+            # We currently separate SelfAttention and MLP as two layers,
+            # so we only need one workspace instead of two.
             for i in range(1 if policy.sep_layer else 2):
-                shape = (max_seq_len, b * n_kv_head, head_dim)
+                shape = (max_seq_len, b * n_head, head_dim)
                 k_cache = self.allocate(shape, np.float32, pin_memory=False)
                 v_cache = self.allocate(shape, np.float32, pin_memory=False)
                 self.attention_compute_workspace.append((k_cache, v_cache))
@@ -302,8 +240,7 @@ class TorchDevice:
         # decompress weights
         if w_token.device.device_type == DeviceType.COMPRESSED:
             w_token = w_token.device.decompress(w_token)
-            if w_pos is not None:
-                w_pos = w_pos.device.decompress(w_pos)
+            w_pos = w_pos.device.decompress(w_pos)
 
         token_ids = inputs.data
         mask = attention_mask.data
@@ -311,124 +248,19 @@ class TorchDevice:
         if donate[1]: attention_mask.delete()
 
         # token embedding
-        # Do not force-zero padding rows in forward (HF uses plain lookup and relies on attention_mask).
-        token_embed = F.embedding(token_ids, w_token.data)
+        token_embed = F.embedding(token_ids, w_token.data, pad_token_id)
 
-        if w_pos is not None:
-            # pos embedding
-            positions = torch.cumsum(mask, dim=1).int() * mask + 1
+        # pos embedding
+        positions = torch.cumsum(mask, dim=1).int() * mask + 1
 
-            # cut positions if `past_key_values_length` is > 0
-            past_key_values_length = mask.shape[1] - token_ids.shape[1]
-            positions = positions[:, past_key_values_length:]
+        # cut positions if `past_key_values_length` is > 0
+        past_key_values_length = mask.shape[1] - token_ids.shape[1]
+        positions = positions[:, past_key_values_length:]
 
-            pos_embed = F.embedding(positions, w_pos.data)
-            data = token_embed + pos_embed
-        else:
-            data = token_embed
+        pos_embed = F.embedding(positions, w_pos.data)
 
+        data = token_embed + pos_embed
         return TorchTensor.create_from_torch(data, self)
-
-    def qwen3_output_embed(self, inputs, w_ln, w_token, donate,
-                           do_sample, temperature):
-        # decompress weights
-        if w_token.device.device_type == DeviceType.COMPRESSED:
-            w_token = w_token.device.decompress(w_token)
-
-        # Qwen3: final RMSNorm + lm_head
-        hidden = rms_norm(inputs.data, w_ln.data)
-        if donate[0]:
-            inputs.delete()
-
-        logits = F.linear(hidden.float(), w_token.data.float())
-        last_token_logits = logits[:, -1, :]
-
-        maybe_dump_debug(
-            "flex_output_logits",
-            last_token_logits=last_token_logits,
-            topk_values=torch.topk(last_token_logits, k=min(10, last_token_logits.shape[-1]), dim=-1).values,
-            topk_indices=torch.topk(last_token_logits, k=min(10, last_token_logits.shape[-1]), dim=-1).indices,
-        )
-
-        # decode helpers (optional): repetition penalty + no-repeat ngram + top-k/top-p
-        try:
-            from flexllmgen import flex_opt as _flex_opt_mod
-            _task = getattr(_flex_opt_mod, "GLOBAL_TASK", None)
-            rep_penalty = float(getattr(_task, "repetition_penalty", 1.0))
-            no_repeat_ngram_size = int(getattr(_task, "no_repeat_ngram_size", 0))
-            top_p = float(getattr(_task, "top_p", 1.0))
-            top_k = int(getattr(_task, "top_k", 0))
-            output_ids = getattr(_flex_opt_mod, "GLOBAL_OUTPUT_IDS", None)
-            cur_pos = getattr(_flex_opt_mod, "GLOBAL_CUR_POS", None)
-        except Exception:
-            rep_penalty = 1.0
-            no_repeat_ngram_size = 0
-            top_p = 1.0
-            top_k = 0
-            output_ids = None
-            cur_pos = None
-
-        if output_ids is not None and cur_pos is not None and _task is not None:
-            prompt_len = int(getattr(_task, "prompt_len", 0))
-            # Only apply decode-time constraints on generated continuation,
-            # avoid left-padding/prompt tokens polluting penalties.
-            gen_start = max(prompt_len, 0)
-
-            # repetition penalty on generated tokens only
-            if rep_penalty > 1.0 and cur_pos > gen_start:
-                for bi in range(last_token_logits.shape[0]):
-                    seen = set(output_ids[bi, gen_start:cur_pos].tolist())
-                    if len(seen) > 0:
-                        idx = torch.tensor(list(seen), device=last_token_logits.device, dtype=torch.long)
-                        vals = last_token_logits[bi, idx]
-                        vals = torch.where(vals > 0, vals / rep_penalty, vals * rep_penalty)
-                        last_token_logits[bi, idx] = vals
-
-            # no-repeat ngram on generated continuation only
-            if no_repeat_ngram_size > 0 and (cur_pos - gen_start) >= (no_repeat_ngram_size - 1):
-                n = no_repeat_ngram_size
-                for bi in range(last_token_logits.shape[0]):
-                    seq = output_ids[bi, gen_start:cur_pos].tolist()
-                    if len(seq) < n - 1:
-                        continue
-                    prefix = tuple(seq[-(n - 1):]) if n > 1 else tuple()
-                    banned = set()
-                    for t in range(len(seq) - n + 1):
-                        if n == 1 or tuple(seq[t:t + n - 1]) == prefix:
-                            banned.add(seq[t + n - 1])
-                    if banned:
-                        bidx = torch.tensor(list(banned), device=last_token_logits.device, dtype=torch.long)
-                        last_token_logits[bi, bidx] = -1e9
-
-        if do_sample and not temperature < 1e-5:
-            logits_for_sampling = last_token_logits / temperature
-
-            # top-k filtering
-            if top_k > 0 and top_k < logits_for_sampling.shape[-1]:
-                topk_vals, _ = torch.topk(logits_for_sampling, k=top_k, dim=-1)
-                kth = topk_vals[..., -1, None]
-                logits_for_sampling = logits_for_sampling.masked_fill(logits_for_sampling < kth, -1e9)
-
-            # top-p (nucleus) filtering
-            if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(logits_for_sampling, descending=True, dim=-1)
-                sorted_probs = torch.softmax(sorted_logits, dim=-1)
-                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-
-                sorted_indices_to_remove = cumulative_probs > top_p
-                # Keep at least one token
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                sorted_indices_to_remove[..., 0] = False
-
-                sorted_logits = sorted_logits.masked_fill(sorted_indices_to_remove, -1e9)
-                logits_for_sampling = torch.full_like(logits_for_sampling, -1e9)
-                logits_for_sampling.scatter_(dim=-1, index=sorted_indices, src=sorted_logits)
-
-            probs = torch.softmax(logits_for_sampling, dim=-1)
-            ids = torch.multinomial(probs, num_samples=1)
-        else:
-            ids = last_token_logits.argmax(dim=1, keepdim=True)
-        return TorchTensor.create_from_torch(ids, self)
 
     def opt_output_embed(self, inputs, w_ln, b_ln, w_token, donate,
                          do_sample, temperature):
@@ -438,70 +270,12 @@ class TorchDevice:
 
         b, s, h = inputs.shape
 
-        if b_ln is None:
-            hidden = rms_norm(inputs.data, w_ln.data)
-        else:
-            hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
+        hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
         if donate[0]: inputs.delete()
 
-        # output embedding (keep fp32 logits for stable argmax/sampling)
-        logits = F.linear(hidden.float(), w_token.data.float())
-        last_token_logits = logits[:, -1, :]
-
-        maybe_dump_debug(
-            "flex_output_logits",
-            last_token_logits=last_token_logits,
-            topk_values=torch.topk(last_token_logits, k=min(10, last_token_logits.shape[-1]), dim=-1).values,
-            topk_indices=torch.topk(last_token_logits, k=min(10, last_token_logits.shape[-1]), dim=-1).indices,
-        )
-
-        # decode helpers (optional): repetition penalty + no-repeat ngram + top-k/top-p
-        try:
-            from flexllmgen import flex_opt as _flex_opt_mod
-            _task = getattr(_flex_opt_mod, "GLOBAL_TASK", None)
-            rep_penalty = getattr(_task, "repetition_penalty", 1.0)
-            no_repeat_ngram_size = getattr(_task, "no_repeat_ngram_size", 0)
-            top_p = float(getattr(_task, "top_p", 1.0))
-            top_k = int(getattr(_task, "top_k", 0))
-            output_ids = getattr(_flex_opt_mod, "GLOBAL_OUTPUT_IDS", None)
-            cur_pos = getattr(_flex_opt_mod, "GLOBAL_CUR_POS", None)
-        except Exception:
-            rep_penalty = 1.0
-            no_repeat_ngram_size = 0
-            top_p = 1.0
-            top_k = 0
-            output_ids = None
-            cur_pos = None
-
-        if output_ids is not None and cur_pos is not None and _task is not None:
-            prompt_len = int(getattr(_task, "prompt_len", 0))
-            gen_start = max(prompt_len, 0)
-
-            # repetition penalty on generated tokens only
-            if rep_penalty is not None and rep_penalty > 1.0 and cur_pos > gen_start:
-                for bi in range(last_token_logits.shape[0]):
-                    seen = set(output_ids[bi, gen_start:cur_pos].tolist())
-                    if len(seen) > 0:
-                        idx = torch.tensor(list(seen), device=last_token_logits.device, dtype=torch.long)
-                        vals = last_token_logits[bi, idx]
-                        vals = torch.where(vals > 0, vals / rep_penalty, vals * rep_penalty)
-                        last_token_logits[bi, idx] = vals
-
-            # no repeat ngram on generated continuation only
-            if no_repeat_ngram_size is not None and no_repeat_ngram_size > 0 and (cur_pos - gen_start) >= (no_repeat_ngram_size - 1):
-                n = no_repeat_ngram_size
-                for bi in range(last_token_logits.shape[0]):
-                    seq = output_ids[bi, gen_start:cur_pos].tolist()
-                    if len(seq) < n - 1:
-                        continue
-                    prefix = tuple(seq[-(n-1):])
-                    banned = set()
-                    for t in range(0, len(seq) - n + 1):
-                        if tuple(seq[t:t+n-1]) == prefix:
-                            banned.add(seq[t+n-1])
-                    if len(banned) > 0:
-                        idx = torch.tensor(list(banned), device=last_token_logits.device, dtype=torch.long)
-                        last_token_logits[bi, idx] = -1e9
+        # output embedding
+        logits = F.linear(hidden, w_token.data)
+        last_token_logits = logits[:,-1,:]
 
         if do_sample and not temperature < 1e-5:
             probs = torch.softmax(last_token_logits / temperature, dim=-1)
@@ -512,10 +286,9 @@ class TorchDevice:
 
     def init_cache_one_gpu_batch(self, config, task, policy):
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-            getattr(config, "n_kv_head", config.n_head), config.input_dim, task.prompt_len, task.gen_len,
+            config.n_head, config.input_dim, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
-        head_dim = getattr(config, "head_dim", hidden_size // config.n_head)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, head_dim)
+        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
         # NOTE: disable pin_memory due to high memory overhead
         pin_memory = False
         k_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
@@ -523,7 +296,7 @@ class TorchDevice:
         return k_cache, v_cache
 
     def mha(self, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
-            w_out, b_out, w_qn, b_qn, w_kn, b_kn, w_ln, b_ln, n_head, n_kv_head, head_dim, donate, compress_cache, comp_config, layer_id=None):
+            w_out, b_out, w_ln, b_ln, n_head, donate, compress_cache, comp_config):
         """Multi-head attention (prefill phase)."""
         # decompress weights
         if w_q.device.device_type == DeviceType.COMPRESSED:
@@ -533,60 +306,29 @@ class TorchDevice:
             w_out = w_out.device.decompress(w_out)
 
         b, s, h = inputs.shape
+        head_dim = h // n_head
         scaling = head_dim ** -0.5
 
-        if b_ln is None:
-            hidden = rms_norm(inputs.data, w_ln.data)
-        else:
-            hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
+        hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
 
-        # shape: (b, s, qkv_dim)
-        # Match HF numerics better: keep attention projections in fp32
-        hidden_proj = hidden.float()
-        q = F.linear(hidden_proj, w_q.data.float(), bias=(b_q.data.float() if b_q is not None else None))
-        k = F.linear(hidden_proj, w_k.data.float(), bias=(b_k.data.float() if b_k is not None else None))
-        v = F.linear(hidden_proj, w_v.data.float(), bias=(b_v.data.float() if b_v is not None else None))
-        
-        # GQA support: K/V may have fewer heads than Q
+        # shape: (b, s, h)
+        q = F.linear(hidden, w_q.data, bias=b_q.data) * scaling
+        k = F.linear(hidden, w_k.data, bias=b_k.data)
+        v = F.linear(hidden, w_v.data, bias=b_v.data)
         # shape: (b, s, n_head, head_dim)
         q = q.view(b, s, n_head, head_dim)
-        # shape: (b, s, n_kv_head, head_dim)
-        k = k.view(b, s, n_kv_head, head_dim)
-        v = v.view(b, s, n_kv_head, head_dim)
-
-        # Qwen3: per-head RMSNorm on q/k before RoPE
-        if b_qn is None and b_kn is None and w_qn is not None and w_kn is not None:
-            q = rms_norm(q, w_qn.data.view(1, 1, 1, -1))
-            k = rms_norm(k, w_kn.data.view(1, 1, 1, -1))
-
-        # Apply RoPE for Qwen-style (no q/k bias => b_q and b_k are None)
-        if b_q is None and b_k is None:
-            # left-padding aware position ids
-            positions = attention_mask.data.long().cumsum(dim=1) - 1
-            positions = torch.clamp(positions, min=0).to(device=q.device)
-            q = apply_rope(q, positions)
-            k = apply_rope(k, positions)
-
-        # Keep KV cache in n_kv_head format; use repeated views only for attention compute
-        k_store = k
-        v_store = v
-        if n_kv_head < n_head:
-            n_rep = n_head // n_kv_head
-            k_attn = k.repeat_interleave(n_rep, dim=2)
-            v_attn = v.repeat_interleave(n_rep, dim=2)
-        else:
-            k_attn = k
-            v_attn = v
+        k = k.view(b, s, n_head, head_dim)
+        v = v.view(b, s, n_head, head_dim)
 
         # shape: (b * n_head, s, head_dim)
         q = q.permute(0, 2, 1, 3).reshape(b * n_head, s, head_dim)
         # shape: (b * n_head, head_dim, s)
-        k = k_attn.permute(0, 2, 3, 1).reshape(b * n_head, head_dim, s)
+        k = k.permute(0, 2, 3, 1).reshape(b * n_head, head_dim, s)
         # shape: (b * n_head, s, head_dim)
-        v = v_attn.permute(0, 2, 1, 3).reshape(b * n_head, s, head_dim)
+        v = v.permute(0, 2, 1, 3).reshape(b * n_head, s, head_dim)
 
         # shape: (b * n_head, s, s)
-        attn_scores = torch.bmm(q.float(), k.float()) * scaling
+        attn_weights = torch.bmm(q, k)
 
         # shape: (b, 1, s, s)
         idx = torch.arange(s, device=self.dev)
@@ -594,39 +336,24 @@ class TorchDevice:
         mask = attention_mask.data.view(b, 1, 1, s) & causal_mask
 
         # shape: (b, n_head, s, s)
-        attn_scores = attn_scores.view(b, n_head, s, s)
-        attn_scores = torch.where(mask, attn_scores, torch.tensor(-1e4, device=attn_scores.device, dtype=attn_scores.dtype))
-        # Match HF: softmax in fp32, then cast back
-        attn_probs = F.softmax(attn_scores.view(b * n_head, s, s).float(), dim=2).to(dtype=attn_scores.dtype)
+        attn_weights = attn_weights.view(b, n_head, s, s)
+        attn_weights = torch.where(mask, attn_weights, -1e4)
+        attn_weights = attn_weights.view(b * n_head, s, s)
+        attn_weights = F.softmax(attn_weights, dim=2)
         # shape: (b, n_head, s, head_dim)
-        value = torch.bmm(attn_probs.float(), v.float()).to(dtype=v.dtype).view(b, n_head, s, head_dim)
-        # shape: (b, s, qkv_dim)
-        qkv_dim = n_head * head_dim
-        value = value.transpose(1, 2).reshape(b, s, qkv_dim)
-        value = F.linear(value.float(), w_out.data.float(),
-            bias=(b_out.data.float() if b_out is not None else None)).to(dtype=hidden.dtype)
+        value = torch.bmm(attn_weights, v).view(b, n_head, s, head_dim)
+        # shape: (b, s, h)
+        value = value.transpose(1, 2).reshape(b, s, h)
+        value = F.linear(value, w_out.data, bias=b_out.data)
 
-        maybe_dump_debug(
-            "flex_mha_prefill",
-            layer_id=layer_id,
-            hidden=hidden,
-            q=q,
-            k_attn=k,
-            v_attn=v,
-            attn_scores=attn_scores,
-            attn_probs=attn_probs.view(b, n_head, s, s),
-            value_before_residual=value,
-            attention_mask=attention_mask.data,
-        )
-
-        value = (value.float() + inputs.data.float()).to(dtype=inputs.data.dtype)
+        value.add_(inputs.data)
 
         if donate[0]: inputs.delete()
         if donate[1]: attention_mask.delete()
 
-        # cache should stay in (s, b * n_kv_head, head_dim)
-        k = k_store.permute(1, 0, 2, 3).reshape(s, b * n_kv_head, head_dim)
-        v = v_store.permute(1, 0, 2, 3).reshape(s, b * n_kv_head, head_dim)
+        # (s, b * n_head, head_dim)
+        k = k.permute(2, 0, 1)
+        v = v.permute(1, 0, 2)
 
         if compress_cache:
             k = self.compressed_device.compress(k, comp_config)
@@ -638,8 +365,8 @@ class TorchDevice:
         return TorchTensor.create_from_torch(value, self), k, v
 
     def mha_gen(self, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
-                w_out, b_out, w_qn, b_qn, w_kn, b_kn, w_ln, b_ln, n_head, n_kv_head, head_dim, k_cache, v_cache, donate,
-                attn_sparsity, compress_cache, comp_config, layer_id=None):
+                w_out, b_out, w_ln, b_ln, n_head, k_cache, v_cache, donate,
+                attn_sparsity, compress_cache, comp_config):
         """Multi-head attention (decoding phase)."""
         # decompress weights
         if w_q.device.device_type == DeviceType.COMPRESSED:
@@ -650,84 +377,44 @@ class TorchDevice:
 
         b, tgt_s, h = inputs.shape
         src_s = attention_mask.shape[1]
+        head_dim = h // n_head
         scaling = head_dim ** -0.5
 
-        if b_ln is None:
-            hidden = rms_norm(inputs.data, w_ln.data)
-        else:
-            hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
+        hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
 
-        # shape: (b, 1, qkv_dim)
-        hidden_proj = hidden.float()
-        q = F.linear(hidden_proj, w_q.data.float(), bias=(b_q.data.float() if b_q is not None else None))
-        k = F.linear(hidden_proj, w_k.data.float(), bias=(b_k.data.float() if b_k is not None else None))
-        v = F.linear(hidden_proj, w_v.data.float(), bias=(b_v.data.float() if b_v is not None else None))
-        
-        # GQA support: K/V may have fewer heads than Q
+        # shape: (b, 1, h)
+        q = F.linear(hidden, w_q.data, bias=b_q.data) * scaling
+        k = F.linear(hidden, w_k.data, bias=b_k.data)
+        v = F.linear(hidden, w_v.data, bias=b_v.data)
         # shape: (b, 1, n_head, head_dim)
         q = q.view(b, tgt_s, n_head, head_dim)
-        # shape: (b, 1, n_kv_head, head_dim)
-        k = k.view(b, tgt_s, n_kv_head, head_dim)
-        v = v.view(b, tgt_s, n_kv_head, head_dim)
-
-        # Qwen3: per-head RMSNorm on q/k before RoPE
-        if b_qn is None and b_kn is None and w_qn is not None and w_kn is not None:
-            q = rms_norm(q, w_qn.data.view(1, 1, 1, -1))
-            k = rms_norm(k, w_kn.data.view(1, 1, 1, -1))
-
-        # Apply RoPE for Qwen-style (no q/k bias => b_q and b_k are None)
-        if b_q is None and b_k is None:
-            # left-padding aware current decode position
-            positions = attention_mask.data.long().sum(dim=1, keepdim=True) - 1
-            positions = torch.clamp(positions, min=0).to(device=q.device)
-            q = apply_rope(q, positions)
-            k = apply_rope(k, positions)
-
-        # Keep KV cache in n_kv_head format; create expanded views only for attention compute
-        if n_kv_head < n_head:
-            n_rep = n_head // n_kv_head
-            k_attn = k.repeat_interleave(n_rep, dim=2)
-            v_attn = v.repeat_interleave(n_rep, dim=2)
-        else:
-            k_attn = k
-            v_attn = v
+        k = k.view(b, tgt_s, n_head, head_dim)
+        v = v.view(b, tgt_s, n_head, head_dim)
 
         # shape: (b * n_head, 1, head_dim)
         q = q.permute(0, 2, 1, 3).reshape(b * n_head, tgt_s, head_dim)
-        # shape: (1, b * n_head, head_dim) for attention compute path
-        k_new_attn = k_attn.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
-        # shape: (1, b * n_head, head_dim) for attention compute path
-        v_new_attn = v_attn.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
-        # shape: (1, b * n_kv_head, head_dim) for cache store path
-        k_new = k.permute(1, 0, 2, 3).reshape(tgt_s, b * n_kv_head, head_dim)
-        v_new = v.permute(1, 0, 2, 3).reshape(tgt_s, b * n_kv_head, head_dim)
+        # shape: (1, b * n_head, head_dim)
+        k_new = k.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
+        # shape: (1, b * n_head, head_dim)
+        v_new = v.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
 
         if isinstance(k_cache, TorchTensor):
             if attn_sparsity >= 1.0:  # Dense attention
                 if compress_cache:
-                    # shape: (s, b * n_kv_head, head_dim)
+                    # shape: (s, b * n_head, head_dim)
                     k = k_cache.device.decompress(k_cache)[:src_s]
                     v = v_cache.device.decompress(v_cache)[:src_s]
                 else:
-                    # shape: (s, b * n_kv_head, head_dim)
+                    # shape: (s, b * n_head, head_dim)
                     k = k_cache.data[:src_s]
                     v = v_cache.data[:src_s]
                 k[src_s - 1:src_s] = k_new
                 v[src_s - 1:src_s] = v_new
 
-                # Expand KV heads only for attention compute
-                if n_kv_head < n_head:
-                    n_rep = n_head // n_kv_head
-                    k_attn_full = k.view(src_s, b, n_kv_head, head_dim).repeat_interleave(n_rep, dim=2).reshape(src_s, b * n_head, head_dim)
-                    v_attn_full = v.view(src_s, b, n_kv_head, head_dim).repeat_interleave(n_rep, dim=2).reshape(src_s, b * n_head, head_dim)
-                else:
-                    k_attn_full = k
-                    v_attn_full = v
-
                 # shape: (b * n_head, head_dim, s)
-                k = k_attn_full.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
+                k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
                 # shape: (b * n_head, s, head_dim)
-                v = v_attn_full.permute(1, 0, 2).reshape(b * n_head, src_s, head_dim)
+                v = v.permute(1, 0, 2).reshape(b * n_head, src_s, head_dim)
 
                 if k.is_cuda:
                     value = self._attention_value(q, k, v, attention_mask.data,
@@ -745,12 +432,12 @@ class TorchDevice:
                 k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
 
                 if k.is_cuda:
-                    value = self._sparse_attention_value(q, k, v_new_attn, v_cache,
+                    value = self._sparse_attention_value(q, k, v_new, v_cache,
                         attention_mask.data, b, src_s, tgt_s, n_head, head_dim,
                         attn_sparsity)
                 else:
                     q = q.float().cpu()
-                    value = self._sparse_attention_value(q, k, v_new_attn, v_cache,
+                    value = self._sparse_attention_value(q, k, v_new, v_cache,
                         attention_mask.data, b, src_s, tgt_s, n_head, head_dim,
                         attn_sparsity).cuda().half()
         else:  # Mixed device attention
@@ -759,23 +446,11 @@ class TorchDevice:
                 k_new, v_new, attention_mask.data, b, src_s, tgt_s,
                 n_head, head_dim)
 
-        # shape: (b, 1, qkv_dim)
-        qkv_dim = n_head * head_dim
-        value = value.transpose(1, 2).view(b, tgt_s, qkv_dim)
-        value = F.linear(value.float(), w_out.data.float(),
-            bias=(b_out.data.float() if b_out is not None else None)).to(dtype=hidden.dtype)
+        # shape: (b, 1, h)
+        value = value.transpose(1, 2).view(b, tgt_s, h)
+        value = F.linear(value, w_out.data, bias=b_out.data)
 
-        maybe_dump_debug(
-            "flex_mha_decode",
-            layer_id=layer_id,
-            q=q,
-            k_new_attn=k_new_attn,
-            v_new_attn=v_new_attn,
-            value_before_residual=value,
-            attention_mask=attention_mask.data,
-        )
-
-        value = (value.float() + inputs.data.float()).to(dtype=inputs.data.dtype)
+        value.add_(inputs.data)
 
         if donate[0]: inputs.delete()
         if donate[1]: attention_mask.delete()
@@ -795,13 +470,12 @@ class TorchDevice:
 
     def _attention_weights(self, q, k, mask, b, src_s, n_head):
         # shape: (b * n_head, 1, s)
-        scaling = q.shape[-1] ** -0.5
-        attn_weights = torch.bmm(q.float(), k.float()) * scaling
+        attn_weights = torch.bmm(q, k)
         # shape: (b, 1, 1, s)
         mask = mask.view(b, 1, 1, src_s)
         # shape: (b * n_head, 1, s)
         attn_weights = attn_weights.view(b, n_head, 1, src_s)
-        attn_weights = torch.where(mask, attn_weights, torch.tensor(-1e4, device=attn_weights.device, dtype=attn_weights.dtype))
+        attn_weights = torch.where(mask, attn_weights, -1e4)
         attn_weights = attn_weights.view(b * n_head, 1, src_s)
         attn_weights = F.softmax(attn_weights, dim=2)
         return attn_weights
@@ -810,7 +484,7 @@ class TorchDevice:
         # shape: (b * n_head, 1, s)
         attn_weights = self._attention_weights(q, k, mask, b, src_s, n_head)
         # shape: (b, n_head, 1, head_dim)
-        return torch.bmm(attn_weights.float(), v.float()).to(dtype=v.dtype).view(b, n_head, tgt_s, head_dim)
+        return torch.bmm(attn_weights, v).view(b, n_head, tgt_s, head_dim)
 
     def _sparse_attention_value(self, q, k, v_new, v_cache, mask, b,
                                 src_s, tgt_s, n_head, head_dim, attn_sparsity):
@@ -909,26 +583,6 @@ class TorchDevice:
         if donate[0]: inputs.delete()
         return TorchTensor.create_from_torch(out, self)
 
-    def mlp_swiglu(self, inputs, w_gate, w_up, w_down, w_ln, donate):
-        # decompress weights
-        if w_gate.device.device_type == DeviceType.COMPRESSED:
-            w_gate = w_gate.device.decompress(w_gate)
-            w_up = w_up.device.decompress(w_up)
-            w_down = w_down.device.decompress(w_down)
-
-        b, s, h = inputs.shape
-
-        out = rms_norm(inputs.data, w_ln.data)
-        out_fp32 = out.float()
-        gate = F.linear(out_fp32, w_gate.data.float(), bias=None)
-        up = F.linear(out_fp32, w_up.data.float(), bias=None)
-        out = F.silu(gate) * up
-        out = F.linear(out, w_down.data.float(), bias=None).to(dtype=inputs.data.dtype)
-
-        out.add_(inputs.data)
-        if donate[0]: inputs.delete()
-        return TorchTensor.create_from_torch(out, self)
-
     def synchronize(self):
         torch.cuda.synchronize()
 
@@ -1012,10 +666,9 @@ class TorchDisk:
 
     def init_cache_one_gpu_batch(self, config, task, policy):
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-            getattr(config, "n_kv_head", config.n_head), config.input_dim, task.prompt_len, task.gen_len,
+            config.n_head, config.input_dim, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
-        head_dim = getattr(config, "head_dim", hidden_size // config.n_head)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, head_dim)
+        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
         k_cache = self.allocate(shape, np.float16)
         v_cache = self.allocate(shape, np.float16)
         return k_cache, v_cache
@@ -1084,10 +737,9 @@ class TorchMixedDevice:
 
     def init_cache_one_gpu_batch(self, config, task, policy):
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-            getattr(config, "n_kv_head", config.n_head), config.input_dim, task.prompt_len, task.gen_len,
+            config.n_head, config.input_dim, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
-        head_dim = getattr(config, "head_dim", hidden_size // config.n_head)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, head_dim)
+        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
 
         # We have to round to a multiple of `num_head`
         if policy.cache_disk_percent == 0:
@@ -1177,20 +829,11 @@ def general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
         # The tensor is compressed, do recursive calls
         general_copy_compressed(dst, dst_indices, src, src_indices)
     elif src.device.device_type == DeviceType.DISK:
-        # Qwen3 SSD offload safety path: use synchronous copy to avoid
-        # asynchronous disk-copy race/corruption on Windows.
-        src_data = map_to_torch_tensor(src, src_indices)
-        dst_data = map_to_torch_tensor(dst, dst_indices)
-        if src_data.dtype != dst_data.dtype:
-            src_data = src_data.to(dst_data.dtype)
-        dst_data.copy_(src_data, non_blocking=False)
+        # The tensor is on the disk, dispatch to copy threads for asynchronous copy
+        src.device.submit_copy(dst, dst_indices, src, src_indices)
     elif dst.device.device_type == DeviceType.DISK:
-        # Qwen3 SSD offload safety path: use synchronous copy.
-        src_data = map_to_torch_tensor(src, src_indices)
-        dst_data = map_to_torch_tensor(dst, dst_indices)
-        if src_data.dtype != dst_data.dtype:
-            src_data = src_data.to(dst_data.dtype)
-        dst_data.copy_(src_data, non_blocking=False)
+        # The tensor is on the disk, dispatch to copy threads for asynchronous copy
+        dst.device.submit_copy(dst, dst_indices, src, src_indices)
     elif (src.device.device_type == DeviceType.CUDA and
           dst.device.device_type == DeviceType.CPU and
           not dst.data.is_pinned() and src.shape[0] > 1):
@@ -1252,18 +895,11 @@ def copy_worker_func(queue, cuda_id):
 
             if (src.device.device_type == DeviceType.CUDA or
                 dst.device.device_type == DeviceType.CUDA):
-                # Use relay buffer only for fp16 path.
-                # For fp32 tensors (e.g. attention workspace), relaying through
-                # fp16 buffer causes precision loss/corruption.
-                if src_data.dtype == torch.float16 and dst_data.dtype == torch.float16:
-                    size = np.prod(src_data.shape)
-                    tmp_cpu_buf = cpu_buf[:size].view(src_data.shape)
-                    tmp_cpu_buf.copy_(src_data)
-                    dst_data.copy_(tmp_cpu_buf)
-                else:
-                    dst_data.copy_(src_data)
-                # Ensure copy on copy_stream is completed before marking task done.
-                copy_stream.synchronize()
+                # Use a pinned cpu buffer as a relay
+                size = np.prod(src_data.shape)
+                tmp_cpu_buf = cpu_buf[:size].view(src_data.shape)
+                tmp_cpu_buf.copy_(src_data)
+                dst_data.copy_(tmp_cpu_buf)
             else:
                 dst_data.copy_(src_data)
 

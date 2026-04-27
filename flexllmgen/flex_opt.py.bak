@@ -7,7 +7,6 @@ import argparse
 import dataclasses
 import os
 import pickle
-import re
 import time
 from typing import Union, List, Optional
 
@@ -19,7 +18,7 @@ from transformers import AutoTokenizer
 from flexllmgen.compression import CompressionConfig
 from flexllmgen.opt_config import OptConfig, get_opt_config, download_opt_weights
 from flexllmgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink,
-    TorchMixedDevice, DeviceType, general_copy, fix_recursive_import, set_debug_dump)
+    TorchMixedDevice, DeviceType, general_copy, fix_recursive_import)
 from flexllmgen.timer import timers
 from flexllmgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
     array_1d, array_2d, array_3d, str2bool, project_decode_latency,
@@ -29,7 +28,6 @@ from flexllmgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
 fix_recursive_import()
 
 DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
-
 
 
 @dataclasses.dataclass(frozen=True)
@@ -151,34 +149,21 @@ class InputEmbed:
         v, h, s, dtype = (self.config.vocab_size, self.config.input_dim,
             self.config.max_seq_len, self.config.dtype)
         path = os.path.join(path, "")
-
-        if getattr(self.config, "use_pos_embed", True):
-            weight_specs = [
-                # w_token
-                ((v, h), dtype, path + "decoder.embed_tokens.weight"),
-                # w_pos
-                ((s + 2, h), dtype, path + "decoder.embed_positions.weight"),
-            ]
-        else:
-            weight_specs = [
-                # w_token only (RoPE models)
-                ((v, h), dtype, path + "decoder.embed_tokens.weight"),
-            ]
-
+        weight_specs = [
+            # w_token
+            ((v, h), dtype, path + "decoder.embed_tokens.weight"),
+            # w_pos
+            ((s + 2, h), dtype, path + "decoder.embed_positions.weight"),
+        ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
+
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
-        if k != 0:
-            return
-
-        dst = self.weight_load_dst
-        if getattr(self.config, "use_pos_embed", True):
-            w_token, w_pos = weight_home.val
+        w_token, w_pos = weight_home.val
+        if k == 0:
+            dst = self.weight_load_dst
             weight_read_buf.store((w_token.smart_copy(dst), w_pos.smart_copy(dst)))
-        else:
-            w_token = weight_home.val[0]
-            weight_read_buf.store((w_token.smart_copy(dst), (None, False)))
 
     def init_cache_one_gpu_batch(self, cache_home):
         pass  # do nothing
@@ -228,42 +213,23 @@ class OutputEmbed:
         v, h, dtype = (self.config.vocab_size, self.config.input_dim,
             self.config.dtype)
         path = os.path.join(path, "")
-        if getattr(self.config, "model_type", "opt") == "qwen3":
-            lm_head_path = path + "lm_head.weight"
-            if not os.path.exists(lm_head_path):
-                raise FileNotFoundError(f"Qwen3 lm_head.weight not found: {lm_head_path}")
-            print(f"[info] Qwen3 output head: {lm_head_path}")
-            weight_specs = [
-                # w_ln (no bias in Qwen3)
-                ((h,), dtype, path + "decoder.layer_norm.weight"),
-                # lm head (use converted lm_head.weight)
-                ((v, h), dtype, lm_head_path),
-            ]
-        else:
-            weight_specs = [
-                # w_ln
-                ((h,), dtype, path + "decoder.layer_norm.weight"),
-                # b_ln
-                ((h,), dtype, path + "decoder.layer_norm.bias"),
-                # w_token
-                ((v, h), dtype, path + "decoder.embed_tokens.weight"),
-            ]
+        weight_specs = [
+            # w_ln
+            ((h,), dtype, path + "decoder.layer_norm.weight"),
+            # b_ln
+            ((h,), dtype, path + "decoder.layer_norm.bias"),
+            # w_token
+            ((v, h), dtype, path + "decoder.embed_tokens.weight"),
+        ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
 
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
-        if k != 0:
-            return
-
-        dst1 = self.weight_load_dst
-        dst2 = self.compute
-        if getattr(self.config, "model_type", "opt") == "qwen3":
-            w_ln, w_token = weight_home.val
-            weight_read_buf.store((w_ln.smart_copy(dst2), (None, False),
-                w_token.smart_copy(dst1)))
-        else:
-            w_ln, b_ln, w_token = weight_home.val
+        w_ln, b_ln, w_token = weight_home.val
+        if k == 0:
+            dst1 = self.weight_load_dst
+            dst2 = self.compute
             weight_read_buf.store((w_ln.smart_copy(dst2), b_ln.smart_copy(dst2),
                 w_token.smart_copy(dst1)))
 
@@ -307,11 +273,6 @@ class SelfAttention:
         self.attention_compute = (self.env.cpu if self.policy.cpu_cache_compute
             else self.env.gpu)
 
-        # GQA support
-        self.n_head = self.config.n_head
-        self.n_kv_head = getattr(self.config, 'n_kv_head', self.n_head)
-        self.head_dim = self.config.input_dim // self.n_head
-
         self.task = None
 
     def set_task(self, task):
@@ -319,65 +280,43 @@ class SelfAttention:
 
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.input_dim, self.config.dtype)
-        n_kv_head = getattr(self.config, 'n_kv_head', self.config.n_head)
-        head_dim = getattr(self.config, 'head_dim', h // self.config.n_head)
-        qkv_dim = getattr(self.config, 'qkv_dim', self.config.n_head * head_dim)
-
-        if getattr(self.config, "model_type", "opt") == "qwen3":
-            # Qwen3 format: decoder.layers.{id}.self_attn, no bias, input_layernorm
-            path = os.path.join(path, f"decoder.layers.{self.layer_id}.self_attn")
-            weight_specs = [
-                ((qkv_dim, h), dtype, path + ".q_proj.weight"),
-                ((n_kv_head * head_dim, h), dtype, path + ".k_proj.weight"),
-                ((n_kv_head * head_dim, h), dtype, path + ".v_proj.weight"),
-                ((h, qkv_dim), dtype, path + ".out_proj.weight"),
-                ((head_dim,), dtype, path + ".q_norm.weight"),
-                ((head_dim,), dtype, path + ".k_norm.weight"),
-                ((h,), dtype, path.replace("self_attn", "self_attn_layer_norm") + ".weight"),
-            ]
-        else:
-            # OPT format: decoder.layers.{id}.self_attn, with bias
-            path = os.path.join(path, f"decoder.layers.{self.layer_id}.self_attn")
-            weight_specs = [
-                ((h, h), dtype, path + ".q_proj.weight"),
-                ((h,), dtype, path + ".q_proj.bias"),
-                ((h, h), dtype, path + ".k_proj.weight"),
-                ((h,), dtype, path + ".k_proj.bias"),
-                ((h, h), dtype, path + ".v_proj.weight"),
-                ((h,), dtype, path + ".v_proj.bias"),
-                ((h, h), dtype, path + ".out_proj.weight"),
-                ((h,), dtype, path + ".out_proj.bias"),
-                ((h,), dtype, path + "_layer_norm.weight"),
-                ((h,), dtype, path + "_layer_norm.bias"),
-            ]
+        path = os.path.join(os.path.join(path, f"decoder.layers.{self.layer_id}.self_attn"))
+        weight_specs = [
+            # w_q
+            ((h, h), dtype, path + ".q_proj.weight"),
+            # b_q
+            ((h,), dtype, path + ".q_proj.bias"),
+            # w_k
+            ((h, h), dtype, path + ".k_proj.weight"),
+            # b_k
+            ((h,), dtype, path + ".k_proj.bias"),
+            # w_v
+            ((h, h), dtype, path + ".v_proj.weight"),
+            # b_v
+            ((h,), dtype, path + ".v_proj.bias"),
+            # w_out
+            ((h, h), dtype, path + ".out_proj.weight"),
+            # b_out
+            ((h,), dtype, path + ".out_proj.bias"),
+            # w_ln
+            ((h,), dtype, path + "_layer_norm.weight"),
+            # b_ln
+            ((h,), dtype, path + "_layer_norm.bias"),
+        ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
-        if getattr(self.config, "model_type", "opt") == "qwen3":
-            w_q, w_k, w_v, w_out, w_qn, w_kn, w_ln = weight_home.val
-            if k == 0:
-                dst1 = self.weight_load_dst
-                dst2 = self.compute
-                weight_read_buf.store((
-                    w_q.smart_copy(dst1), (None, False),
-                    w_k.smart_copy(dst1), (None, False),
-                    w_v.smart_copy(dst1), (None, False),
-                    w_out.smart_copy(dst1), (None, False),
-                    w_qn.smart_copy(dst2), (None, False),
-                    w_kn.smart_copy(dst2), (None, False),
-                    w_ln.smart_copy(dst2), (None, False)))
-        else:
-            w_q, b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln = weight_home.val
-            if k == 0:
-                dst1 = self.weight_load_dst
-                dst2 = self.compute
-                weight_read_buf.store((
-                    w_q.smart_copy(dst1), b_q.smart_copy(dst2),
-                    w_k.smart_copy(dst1), b_k.smart_copy(dst2),
-                    w_v.smart_copy(dst1), b_v.smart_copy(dst2),
-                    w_out.smart_copy(dst1), b_out.smart_copy(dst2),
-                    w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
+        w_q, b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln = weight_home.val
+        if k == 0:
+            dst1 = self.weight_load_dst
+            dst2 = self.compute
+            weight_read_buf.store((
+                w_q.smart_copy(dst1), b_q.smart_copy(dst2),
+                w_k.smart_copy(dst1), b_k.smart_copy(dst2),
+                w_v.smart_copy(dst1), b_v.smart_copy(dst2),
+                w_out.smart_copy(dst1), b_out.smart_copy(dst2),
+                w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
 
     def init_cache_one_gpu_batch(self, cache_home):
         if self.policy.cache_gpu_percent == 100:
@@ -488,37 +427,33 @@ class SelfAttention:
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
                 cache_write_buf, i, k):
         n_head = self.config.n_head
-        n_kv_head = getattr(self.config, "n_kv_head", n_head)
-        head_dim = getattr(self.config, "head_dim", self.config.input_dim // n_head)
 
-        donate = [False] * 16
+        donate = [False] * 14
         h, donate[0] = hidden.val, True
 
         if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
             ((w_q, donate[2]), (b_q, donate[3]), (w_k, donate[4]), (b_k, donate[5]),
              (w_v, donate[6]), (b_v, donate[7]), (w_out, donate[8]), (b_out, donate[9]),
-             (w_qn, donate[10]), (b_qn, donate[11]), (w_kn, donate[12]), (b_kn, donate[13]),
-             (w_ln, donate[14]), (b_ln, donate[15])) = weight_read_buf.pop()
+             (w_ln, donate[10]), (b_ln, donate[11])) = weight_read_buf.pop()
         else:
             ((w_q, _), (b_q, _), (w_k, _), (b_k, _),
              (w_v, _), (b_v, _), (w_out, _), (b_out, _),
-             (w_qn, _), (b_qn, _), (w_kn, _), (b_kn, _),
              (w_ln, _), (b_ln, _)) = weight_read_buf.val
 
         if i == 0:  # prefill
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
             h, new_k_cache, new_v_cache = self.compute.mha(h, mask, w_q, b_q,
-                w_k, b_k, w_v, b_v, w_out, b_out, w_qn, b_qn, w_kn, b_kn, w_ln, b_ln, n_head, n_kv_head,
-                head_dim, donate, self.policy.compress_cache, self.policy.comp_cache_config, layer_id=self.layer_id)
+                w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, donate,
+                self.policy.compress_cache, self.policy.comp_cache_config)
             cache_write_buf.store((new_k_cache, new_v_cache))
         else:  # decoding
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
             h, new_k_cache, new_v_cache = self.compute.mha_gen(h, mask, w_q,
-                b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_qn, b_qn, w_kn, b_kn, w_ln, b_ln, n_head, n_kv_head,
-                head_dim, k_cache, v_cache, donate, self.policy.attn_sparsity,
-                self.policy.compress_cache, self.policy.comp_cache_config, layer_id=self.layer_id)
+                b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head,
+                k_cache, v_cache, donate, self.policy.attn_sparsity,
+                self.policy.compress_cache, self.policy.comp_cache_config)
             cache_write_buf.store((new_k_cache, new_v_cache))
 
         hidden.val = h
@@ -541,53 +476,27 @@ class MLP:
 
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.input_dim, self.config.dtype)
-
-        if getattr(self.config, "use_swiglu", False):
-            # Qwen3 SwiGLU: down_proj(silu(gate_proj(x)) * up_proj(x))
-            path = os.path.join(path, f"decoder.layers.{self.layer_id}.")
-            weight_specs = [
-                # w_gate (gate_proj)
-                ((self.config.ffn_embed_dim, h), dtype, path + "fc1.weight"),
-                # w_up (up_proj)
-                ((self.config.ffn_embed_dim, h), dtype, path + "fc2.weight"),
-                # w_down
-                ((h, self.config.ffn_embed_dim), dtype, path + "fc3.weight"),
-                # w_ln
-                ((h,), dtype, path + "final_layer_norm.weight"),
-            ]
-        else:
-            path = os.path.join(os.path.join(path, f"decoder.layers.{self.layer_id}."))
-            weight_specs = [
-                # wi
-                ((4 * h, h), dtype, path + "fc1.weight"),
-                # bi
-                ((4 * h,), dtype, path + "fc1.bias"),
-                # wo
-                ((h, 4 * h), dtype, path + "fc2.weight"),
-                # bo
-                ((h,), dtype, path + "fc2.bias"),
-                # w_ln
-                ((h,), dtype, path + "final_layer_norm.weight"),
-                # b_ln
-                ((h,), dtype, path + "final_layer_norm.bias"),
-            ]
-
+        path = os.path.join(os.path.join(path, f"decoder.layers.{self.layer_id}."))
+        weight_specs = [
+            # wi
+            ((4 * h, h), dtype, path + "fc1.weight"),
+            # bi
+            ((4 * h,), dtype, path + "fc1.bias"),
+            # wo
+            ((h, 4 * h), dtype, path + "fc2.weight"),
+            # bo
+            ((h,), dtype, path + "fc2.bias"),
+            # w_ln
+            ((h,), dtype, path + "final_layer_norm.weight"),
+            # b_ln
+            ((h,), dtype, path + "final_layer_norm.bias"),
+        ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
-        if k != 0:
-            return
-
-        if getattr(self.config, "use_swiglu", False):
-            w_gate, w_up, w_down, w_ln = weight_home.val
-            dst1 = self.weight_load_dst
-            dst2 = self.compute
-            weight_read_buf.store((
-                w_gate.smart_copy(dst1), w_up.smart_copy(dst1),
-                w_down.smart_copy(dst1), w_ln.smart_copy(dst2)))
-        else:
-            wi, bi, wo, bo, w_ln, b_ln = weight_home.val
+        wi, bi, wo, bo, w_ln, b_ln = weight_home.val
+        if k == 0:
             dst1 = self.weight_load_dst
             dst2 = self.compute
             weight_read_buf.store((
@@ -609,32 +518,19 @@ class MLP:
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
                 cache_write_buf, i, k):
-        if getattr(self.config, "use_swiglu", False):
-            donate = [False] * 5
-            h, donate[0] = hidden.val, True
+        donate = [False] * 7
+        h, donate[0] = hidden.val, True
 
-            if k == self.policy.num_gpu_batches - 1:
-                ((w_gate, donate[1]), (w_up, donate[2]), (w_down, donate[3]),
-                 (w_ln, donate[4])) = weight_read_buf.pop()
-            else:
-                ((w_gate, _), (w_up, _), (w_down, _), (w_ln, _)) = weight_read_buf.val
-
-            h = self.compute.mlp_swiglu(h, w_gate, w_up, w_down, w_ln, donate)
-            hidden.val = h
+        if k == self.policy.num_gpu_batches - 1:
+            # Clear the weight_read_buf if it is the last gpu batch
+            ((wi, donate[1]), (bi, donate[2]), (wo, donate[3]), (bo, donate[4]),
+             (w_ln, donate[5]), (b_ln, donate[6])) = weight_read_buf.pop()
         else:
-            donate = [False] * 7
-            h, donate[0] = hidden.val, True
+            ((wi, _), (bi, _), (wo, _), (bo, _),
+             (w_ln, _), (b_ln, _)) = weight_read_buf.val
 
-            if k == self.policy.num_gpu_batches - 1:
-                # Clear the weight_read_buf if it is the last gpu batch
-                ((wi, donate[1]), (bi, donate[2]), (wo, donate[3]), (bo, donate[4]),
-                 (w_ln, donate[5]), (b_ln, donate[6])) = weight_read_buf.pop()
-            else:
-                ((wi, _), (bi, _), (wo, _), (bo, _),
-                 (w_ln, _), (b_ln, _)) = weight_read_buf.val
-
-            h = self.compute.mlp(h, wi, bi, wo, bo, w_ln, b_ln, donate)
-            hidden.val = h
+        h = self.compute.mlp(h, wi, bi, wo, bo, w_ln, b_ln, donate)
+        hidden.val = h
 
 
 class TransformerLayer:
@@ -643,109 +539,6 @@ class TransformerLayer:
         self.mlp = MLP(config, env, policy, i)
         self.policy = policy
         self.compute = self.attention.compute
-
-
-class Qwen3SelfAttention(SelfAttention):
-    """Qwen3-specific attention layer wrapper.
-
-    This keeps FlexLLMGen scheduling/offload interfaces unchanged while
-    allowing Qwen3-specific logic to evolve independently from OPT path.
-    """
-    pass
-
-
-class Qwen3MLP(MLP):
-    """Qwen3-specific MLP layer wrapper."""
-    pass
-
-
-class Qwen3OutputEmbed(OutputEmbed):
-    """Qwen3-specific output embedding wrapper.
-
-    Keep this path independent from OPT output embedding for easier alignment.
-    """
-
-    def init_weight(self, weight_home, path):
-        v, h, dtype = (self.config.vocab_size, self.config.input_dim, self.config.dtype)
-        path = os.path.join(path, "")
-        lm_head_path = path + "lm_head.weight"
-        if not os.path.exists(lm_head_path):
-            raise FileNotFoundError(f"Qwen3 lm_head.weight not found: {lm_head_path}")
-        print(f"[info] Qwen3 output head: {lm_head_path}")
-        weight_specs = [
-            ((h,), dtype, path + "decoder.layer_norm.weight"),
-            ((v, h), dtype, lm_head_path),
-        ]
-        weights = init_weight_list(weight_specs, self.policy, self.env)
-        weight_home.store(weights)
-
-    def load_weight(self, weight_home, weight_read_buf, k):
-        if k != 0:
-            return
-        dst1 = self.weight_load_dst
-        dst2 = self.compute
-        w_ln, w_token = weight_home.val
-        weight_read_buf.store((w_ln.smart_copy(dst2), w_token.smart_copy(dst1)))
-
-    def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                cache_write_buf, i, k):
-        donate = [False] * 3
-        h, donate[0] = hidden.val, True
-
-        if k == self.policy.num_gpu_batches - 1:
-            (w_ln, donate[1]), (w_token, donate[2]) = weight_read_buf.pop()
-        else:
-            (w_ln, _), (w_token, _) = weight_read_buf.val
-
-        h = self.compute.qwen3_output_embed(h, w_ln, w_token, donate,
-            self.task.do_sample, self.task.temperature)
-        hidden.val = h
-
-
-class Qwen3TransformerLayer:
-    def __init__(self, config, env, policy, i):
-        self.attention = Qwen3SelfAttention(config, env, policy, i)
-        self.mlp = Qwen3MLP(config, env, policy, i)
-        self.policy = policy
-        self.compute = self.attention.compute
-
-    def set_task(self, task):
-        self.attention.set_task(task)
-        self.mlp.set_task(task)
-
-    def init_weight(self, weight_home, path):
-        home1, home2 = ValueHolder(), ValueHolder()
-        self.attention.init_weight(home1, path)
-        self.mlp.init_weight(home2, path)
-        weight_home.store((home1, home2))
-
-    def load_weight(self, weight_home, weight_read_buf, k):
-        read_buf1, read_buf2 = ValueHolder(), ValueHolder()
-        home1, home2 = weight_home.val
-        self.attention.load_weight(home1, read_buf1, k)
-        self.mlp.load_weight(home2, read_buf2, k)
-        if k == 0:
-            weight_read_buf.store((read_buf1, read_buf2))
-
-    def init_cache_one_gpu_batch(self, cache_home):
-        self.attention.init_cache_one_gpu_batch(cache_home)
-
-    def load_cache(self, cache_home, cache_read_buf, i):
-        self.attention.load_cache(cache_home, cache_read_buf, i)
-
-    def store_cache(self, cache_home, cache_write_buf, i):
-        self.attention.store_cache(cache_home, cache_write_buf, i)
-
-    def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                cache_write_buf, i, k):
-        if k == self.policy.num_gpu_batches - 1:
-            read_buf1, read_buf2 = weight_read_buf.pop()
-        else:
-            read_buf1, read_buf2 = weight_read_buf.val
-
-        self.attention.forward(hidden, cache_read_buf, read_buf1, attention_mask,
-                               cache_write_buf, i, k)
-        self.mlp.forward(hidden, None, read_buf2, attention_mask, None, i, k)
 
     def set_task(self, task):
         self.attention.set_task(task)
@@ -802,24 +595,13 @@ class OptLM:
 
         layers = []
         layers.append(InputEmbed(self.config, self.env, self.policy))
-        is_qwen3 = getattr(self.config, "model_type", "opt") == "qwen3"
         for i in range(self.config.num_hidden_layers):
             if policy.sep_layer:
-                if is_qwen3:
-                    layers.append(Qwen3SelfAttention(self.config, self.env, self.policy, i))
-                    layers.append(Qwen3MLP(self.config, self.env, self.policy, i))
-                else:
-                    layers.append(SelfAttention(self.config, self.env, self.policy, i))
-                    layers.append(MLP(self.config, self.env, self.policy, i))
+                layers.append(SelfAttention(self.config, self.env, self.policy, i))
+                layers.append(MLP(self.config, self.env, self.policy, i))
             else:
-                if is_qwen3:
-                    layers.append(Qwen3TransformerLayer(self.config, self.env, self.policy, i))
-                else:
-                    layers.append(TransformerLayer(self.config, self.env, self.policy, i))
-        if is_qwen3:
-            layers.append(Qwen3OutputEmbed(self.config, self.env, self.policy))
-        else:
-            layers.append(OutputEmbed(self.config, self.env, self.policy))
+                layers.append(TransformerLayer(self.config, self.env, self.policy, i))
+        layers.append(OutputEmbed(self.config, self.env, self.policy))
         self.layers = layers
         self.num_layers = len(layers)
 
@@ -987,17 +769,13 @@ class OptLM:
             left, right = k * gpu_batch_size, (k + 1) * gpu_batch_size
             ids = self.hidden[i][j][k].pop().data.detach().cpu().numpy()
             pos = self.task.prompt_len + i
-            if self.task.stop is not None:
+            if self.task.stop:
                 stopped = self.stopped[left:right]
                 self.output_ids[left:right, pos:pos+1] = np.where(
                     stopped, self.config.pad_token_id, ids)
                 stopped[:] = np.logical_or(stopped, ids == self.task.stop)
             else:
                 self.output_ids[left:right, pos:pos+1] = ids
-
-            global GLOBAL_CUR_POS
-            GLOBAL_CUR_POS = pos + 1
-
         else:  # move to home
             x = self.hidden[i][j][k]
             if x.val:  # x may already be moved due to overlapping
@@ -1052,9 +830,7 @@ class OptLM:
                  stop: Optional[int] = None,
                  debug_mode: Optional[str] = None,
                  cut_gen_len: Optional[int] = None,
-                 verbose: int = 0,
-                 top_p: float = 1.0,
-                 top_k: int = 0):
+                 verbose: int = 0):
         task = Task(
             inputs=inputs,
             prompt_len=len(inputs[0]),
@@ -1063,10 +839,6 @@ class OptLM:
             do_sample=do_sample,
             temperature=temperature,
             stop=stop,
-            repetition_penalty=getattr(self, "repetition_penalty", 1.0),
-            no_repeat_ngram_size=getattr(self, "no_repeat_ngram_size", 0),
-            top_p=top_p,
-            top_k=top_k,
         )
         num_layers = self.num_layers
         num_gpu_batches = self.num_gpu_batches
@@ -1080,11 +852,6 @@ class OptLM:
             self.config.pad_token_id, dtype=np.int32)
         self.stopped = np.zeros((len(task.inputs), 1), dtype=bool)
         self.output_ids[:, :prompt_len] = np.asarray(task.inputs)
-
-        global GLOBAL_TASK, GLOBAL_OUTPUT_IDS, GLOBAL_CUR_POS
-        GLOBAL_TASK = task
-        GLOBAL_OUTPUT_IDS = self.output_ids
-        GLOBAL_CUR_POS = prompt_len
         assert gpu_batch_size * num_gpu_batches == len(task.inputs)
 
         # Intermediate tensors
@@ -1402,75 +1169,35 @@ def get_filename(args):
     return filename
 
 
-def get_test_inputs(prompt_len, num_prompts, tokenizer, prompt_text):
-    prompts = [prompt_text]
-    input_ids = tokenizer(prompts, padding="max_length", truncation=True,
+def get_test_inputs(prompt_len, num_prompts, tokenizer):
+    prompts = ["Paris is the capital city of"]
+    input_ids = tokenizer(prompts, padding="max_length",
                           max_length=prompt_len).input_ids
     return (input_ids[0],) * num_prompts
 
 
-def truncate_to_sentences(text: str, max_sentences: int) -> str:
-    if max_sentences <= 0:
-        return text
-    parts = re.split(r'([。！？!?])', text)
-    out = []
-    sent = 0
-    for i in range(0, len(parts), 2):
-        frag = parts[i]
-        punct = parts[i + 1] if i + 1 < len(parts) else ""
-        chunk = (frag + punct).strip()
-        if not chunk:
-            continue
-        out.append(chunk)
-        if punct:
-            sent += 1
-            if sent >= max_sentences:
-                break
-    return "".join(out).strip()
-
-
 def run_flexllmgen(args):
     print(f"<run_flexllmgen>: args.model: {args.model}")
-    if "qwen3" in args.model.lower():
-        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", padding_side="left", use_fast=False)
-    elif args.model == "facebook/galactica-30b":
+    if args.model == "facebook/galactica-30b":
         tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
     else:
         tokenizer = AutoTokenizer.from_pretrained("facebook/opt-30b", padding_side="left")
-
-    # Align runtime pad token with tokenizer to avoid wrong masks/embeddings.
-    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
-        tokenizer.pad_token = tokenizer.eos_token
-    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-
-
-
-
-
-
-
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
 
     # Task and policy
-    warmup_inputs = get_test_inputs(32, num_prompts, tokenizer, args.prompt)
-    inputs = get_test_inputs(prompt_len, num_prompts, tokenizer, args.prompt)
-    # By default, use tokenizer eos as stop token. Users can override via --stop-token-id.
-    stop_token_id = args.stop_token_id if args.stop_token_id >= 0 else tokenizer.eos_token_id
-
-
+    warmup_inputs = get_test_inputs(32, num_prompts, tokenizer)
+    inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
 
     gpu = TorchDevice("cuda:0")
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
     env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
 
-    w_gpu, w_cpu, c_gpu, c_cpu, a_gpu, a_cpu = args.percent
-
     policy = Policy(args.gpu_batch_size, args.num_gpu_batches,
-                    w_gpu, w_cpu,
-                    c_gpu, c_cpu,
-                    a_gpu, a_cpu,
+                    args.percent[0], args.percent[1],
+                    args.percent[2], args.percent[3],
+                    args.percent[4], args.percent[5],
                     args.overlap, args.sep_layer, args.pin_weight,
                     args.cpu_cache_compute, args.attn_sparsity,
                     args.compress_weight,
@@ -1479,13 +1206,9 @@ def run_flexllmgen(args):
                     args.compress_cache,
                     CompressionConfig(num_bits=4, group_size=64,
                                       group_dim=2, symmetric=False))
-
-    set_debug_dump(enabled=args.debug_dump, dump_dir=args.debug_dump_dir, layer=args.debug_layer)
-
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
     opt_config = get_opt_config(args.model)
-    opt_config = dataclasses.replace(opt_config, pad_token_id=pad_token_id)
     cache_size = opt_config.cache_bytes(num_prompts, prompt_len + gen_len)
     hidden_size = opt_config.hidden_bytes(num_prompts, prompt_len + gen_len)
     print(f"model size: {opt_config.model_bytes()/GB:.3f} GB, "
@@ -1497,43 +1220,15 @@ def run_flexllmgen(args):
 
     try:
         print("warmup - generate")
-        model.repetition_penalty = args.repetition_penalty
-        model.no_repeat_ngram_size = args.no_repeat_ngram_size
-
         output_ids = model.generate(
-            warmup_inputs, max_new_tokens=1,
-            do_sample=args.do_sample, temperature=args.temperature,
-            stop=stop_token_id,
-            verbose=args.verbose,
-            top_p=args.top_p, top_k=args.top_k)
-
-        # Reset one-shot debug dump so benchmark prefill tensors are captured.
-        set_debug_dump(enabled=args.debug_dump, dump_dir=args.debug_dump_dir, layer=args.debug_layer)
+            warmup_inputs, max_new_tokens=1, verbose=args.verbose)
 
         print("benchmark - generate")
         timers("generate").reset()
-
-
-        # Respect CLI decoding controls in benchmark run as well.
         output_ids = model.generate(
             inputs, max_new_tokens=args.gen_len,
-            do_sample=args.do_sample, temperature=args.temperature,
-            stop=stop_token_id,
-            debug_mode=args.debug_mode, cut_gen_len=cut_gen_len, verbose=args.verbose,
-            top_p=args.top_p, top_k=args.top_k)
+            debug_mode=args.debug_mode, cut_gen_len=cut_gen_len, verbose=args.verbose)
         costs = timers("generate").costs
-
-
-
-        # output_ids = model.generate(
-        #     inputs, max_new_tokens=args.gen_len,
-        #     do_sample=args.do_sample, temperature=args.temperature,
-        #     stop=stop_token_id,
-        #     debug_mode=args.debug_mode, cut_gen_len=cut_gen_len, verbose=args.verbose)
-        # costs = timers("generate").costs
-
-
-
     finally:
         env.close_copy_threads()
 
@@ -1551,16 +1246,8 @@ def run_flexllmgen(args):
     _, gpu_peak_mem = gpu.mem_stats()
     _, cpu_peak_mem = cpu.mem_stats()
 
-    if args.debug_dump:
-        os.makedirs(args.debug_dump_dir, exist_ok=True)
-        np.save(os.path.join(args.debug_dump_dir, "flex_output_ids.npy"), output_ids)
-        np.save(os.path.join(args.debug_dump_dir, "flex_prompt_ids.npy"), np.asarray(inputs, dtype=np.int32))
-
     if DUMMY_WEIGHT not in args.path:
-        decode_ids = output_ids[:, prompt_len:] if args.skip_prompt_in_output else output_ids
-        outputs = tokenizer.batch_decode(decode_ids, skip_special_tokens=True)
-        if args.max_sentences > 0:
-            outputs = [truncate_to_sentences(x, args.max_sentences) for x in outputs]
+        outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
         show_str = "Outputs:\n" + 70 * '-' + "\n"
         for i in [0, len(outputs)-1]:
             show_str += f"{i}: {outputs[i]}\n"
@@ -1595,32 +1282,6 @@ def add_parser_arguments(parser):
         help="The directory to offload tensors. ")
     parser.add_argument("--prompt-len", type=int, default=512)
     parser.add_argument("--gen-len", type=int, default=32)
-    parser.add_argument("--do-sample", type=str2bool, nargs='?', const=True, default=False,
-        help="Whether to use sampling instead of greedy decoding.")
-    parser.add_argument("--temperature", type=float, default=0.7,
-        help="Sampling temperature. Ignored when --do-sample=false.")
-    parser.add_argument("--skip-prompt-in-output", type=str2bool, nargs='?', const=True, default=True,
-        help="If true, only decode generated continuation (without echoing prompt).")
-    parser.add_argument("--max-sentences", type=int, default=0,
-        help="If >0, truncate final decoded text to at most this many sentences.")
-    parser.add_argument("--top-p", type=float, default=1.0,
-        help="Nucleus sampling threshold in (0,1]. 1.0 disables.")
-    parser.add_argument("--top-k", type=int, default=0,
-        help="Top-k sampling cutoff. 0 disables.")
-    parser.add_argument("--stop-token-id", type=int, default=-1,
-        help="Stop generation when this token id is generated. -1 means disabled.")
-    parser.add_argument("--repetition-penalty", type=float, default=1.0,
-        help="Penalty >1.0 discourages repeated tokens. 1.0 disables.")
-    parser.add_argument("--no-repeat-ngram-size", type=int, default=0,
-        help="Disallow repeating ngrams of this size. 0 disables.")
-    parser.add_argument("--prompt", type=str, default="Paris is the capital city of",
-        help="Input prompt text for generation.")
-    parser.add_argument("--debug-dump", action="store_true",
-        help="Dump intermediate tensors for layer alignment debugging.")
-    parser.add_argument("--debug-dump-dir", type=str, default="./debug",
-        help="Directory to write debug tensor dumps.")
-    parser.add_argument("--debug-layer", type=int, default=0,
-        help="Transformer layer index to dump in debug mode.")
     parser.add_argument("--cut-gen-len", type=int,
         help="Cut generation length for fast debugging.")
     parser.add_argument("--debug-mode", type=str,
@@ -1650,7 +1311,6 @@ def add_parser_arguments(parser):
 
     parser.add_argument("--log-file", type=str, default="auto")
     parser.add_argument("--no-log", action="store_true")
-    
     parser.add_argument("--verbose", type=int, default=2)
 
     parser.add_argument("--overlap", type=str2bool, nargs='?',

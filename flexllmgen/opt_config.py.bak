@@ -17,7 +17,6 @@ from tqdm import tqdm
 @dataclasses.dataclass(frozen=True)
 class OptConfig:
     name: str = "opt-125m"
-    model_type: str = "opt"
     num_hidden_layers: int = 12
     max_seq_len: int = 2048
     hidden_size: int = 768
@@ -30,8 +29,6 @@ class OptConfig:
     layer_norm_eps: float = 0.00001
     pad_token_id: int = 1
     dtype: type = np.float16
-    use_pos_embed: bool = True
-    use_swiglu: bool = False
 
     def model_bytes(self):
         h = self.input_dim
@@ -47,12 +44,6 @@ class OptConfig:
 
     def cache_bytes(self, batch_size, seq_len):
         return 2 * batch_size * seq_len * self.num_hidden_layers * self.input_dim * 2
-
-    def hidden_bytes(self, batch_size, seq_len):
-        """Calculate hidden state memory size."""
-        # Hidden states: batch_size * seq_len * hidden_size * dtype_bytes
-        dtype_bytes = 2 if self.dtype == np.float16 else 4
-        return batch_size * seq_len * self.hidden_size * dtype_bytes
 
     def hidden_bytes(self, batch_size, seq_len):
         return batch_size * seq_len * self.input_dim * 2
@@ -129,10 +120,6 @@ def get_opt_config(name, **kwargs):
             hidden_size=12288, input_dim=12288, ffn_embed_dim=12288 * 4,
         )
     else:
-        # Check for Qwen3 models (GQA support)
-        if "qwen3" in name.lower():
-            return get_qwen3_config(name, **kwargs)
-        
         raise ValueError(f"Invalid model name: {name}")
 
     return dataclasses.replace(config, **kwargs)
@@ -230,8 +217,6 @@ def disable_hf_opt_init():
 
 
 def download_opt_weights(model_name, path):
-    # Expand ~ in path
-    path = os.path.expanduser(path)
     from huggingface_hub import snapshot_download
     import torch
 
@@ -240,20 +225,7 @@ def download_opt_weights(model_name, path):
           f"If it seems to get stuck, you can monitor the progress by "
           f"checking the memory usage of this process.")
 
-    # Handle Qwen3 models
-    if "qwen3" in model_name.lower():
-        hf_model_name = "Qwen/Qwen3-0.6B"
-        if "/" in model_name:
-            hf_model_name = model_name
-        print(f"Loading Qwen3 model from {hf_model_name}")
-        # Qwen3 uses safetensors format
-        folder = snapshot_download(hf_model_name, allow_patterns="*.safetensors")
-        # Normalize local folder name to match runtime config path (e.g. qwen3-0.6b-np)
-        local_name = model_name.split("/")[-1].lower().replace("_", "-")
-        # Convert safetensors to numpy for Qwen3
-        convert_qwen3_weights_to_np(folder, path, local_name)
-        return
-    elif "opt" in model_name:
+    if "opt" in model_name:
         hf_model_name = "facebook/" + model_name
     elif "galactica" in model_name:
         hf_model_name = "facebook/" + model_name
@@ -282,24 +254,25 @@ def download_opt_weights(model_name, path):
                     "decoder.embed_tokens.weight", "lm_head.weight"))
 
 
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str)
+    parser.add_argument("--path", type=str, default="~/opt_weights")
+    args = parser.parse_args()
+
+    download_opt_weights(args.model, args.path)
 # ============== Qwen3 Config (GQA Support) ==============
 @dataclasses.dataclass(frozen=True)
 class Qwen3Config:
     name: str = "qwen3-0.6b"
-    model_type: str = "qwen3"
-    use_pos_embed: bool = False
-    use_swiglu: bool = True
     num_hidden_layers: int = 28
-    max_seq_len: int = 40960
+    max_seq_len: int = 32768
     hidden_size: int = 1024
     n_head: int = 16              # Q头数
     n_kv_head: int = 8            # KV头数 (GQA关键!)
-    head_dim: int = 128           # Qwen3 uses larger head_dim
-    qkv_dim: int = 2048           # n_head * head_dim
     input_dim: int = 1024
     ffn_embed_dim: int = 3072     # SwiGLU中间维度
     vocab_size: int = 151936
-    pad_token_id: int = 0
     layer_norm_eps: float = 1e-6
     rope_theta: float = 1000000
     dtype: type = np.float16
@@ -320,12 +293,6 @@ class Qwen3Config:
         head_dim = self.input_dim // self.n_head
         return 2 * batch_size * seq_len * self.num_hidden_layers * self.n_kv_head * head_dim * 2
 
-    def hidden_bytes(self, batch_size, seq_len):
-        """Calculate hidden state memory size."""
-        # Hidden states: batch_size * seq_len * hidden_size * dtype_bytes
-        dtype_bytes = 2 if self.dtype == np.float16 else 4
-        return batch_size * seq_len * self.hidden_size * dtype_bytes
-
 
 def get_qwen3_config(name, **kwargs):
     if "/" in name:
@@ -336,116 +303,3 @@ def get_qwen3_config(name, **kwargs):
         return Qwen3Config(name=name, **kwargs)
     else:
         raise ValueError(f"Unknown Qwen3 model: {name}")
-
-def convert_qwen3_weights_to_np(hf_folder, output_path, model_name):
-    """Convert Qwen3 safetensors weights to numpy format."""
-    import os
-    import numpy as np
-    import torch
-    from safetensors.torch import load_file
-    
-    print(f"Converting Qwen3 weights from {hf_folder} to numpy format...")
-    
-    # Create output directory
-    # Expand ~ in output_path
-    output_path = os.path.expanduser(output_path)
-    np_output_dir = os.path.join(output_path, model_name + "-np")
-    os.makedirs(np_output_dir, exist_ok=True)
-    
-    # Find safetensors file
-    safetensors_file = None
-    for f in os.listdir(hf_folder):
-        if f.endswith(".safetensors"):
-            safetensors_file = os.path.join(hf_folder, f)
-            break
-    
-    if safetensors_file is None:
-        raise FileNotFoundError(f"No safetensors file found in {hf_folder}")
-    
-    print(f"Found safetensors file: {safetensors_file}")
-    
-    # Load all tensors using torch (supports bfloat16)
-    print("Loading tensors with torch...")
-    tensors = load_file(safetensors_file, device="cpu")
-    print(f"Found {len(tensors)} tensors in safetensors file")
-    
-    # Map Qwen3 weight names to OPT-style names
-    # Qwen3-0.6B has 28 layers
-    num_layers = 28
-    
-    weight_mapping = {
-        "model.embed_tokens.weight": "decoder.embed_tokens.weight",
-        "model.norm.weight": "decoder.layer_norm.weight",
-        "lm_head.weight": "lm_head.weight",
-    }
-
-    # Qwen3 uses embedding-only positions (RoPE), so OPT positional embedding is absent
-    # We create a dummy positional embedding to satisfy FlexLLMGen weight loader.
-    embed_weight = tensors.get("model.embed_tokens.weight")
-    if embed_weight is not None:
-        max_pos = 40960
-        pos_shape = (max_pos + 2, embed_weight.shape[1])
-        pos_path = os.path.join(np_output_dir, "decoder.embed_positions.weight")
-        os.makedirs(os.path.dirname(pos_path), exist_ok=True)
-        with open(pos_path, "wb") as f:
-            np.save(f, np.zeros(pos_shape, dtype=np.float16))
-    
-    # Add layer mappings
-    for i in range(num_layers):
-        prefix = f"model.layers.{i}"
-        weight_mapping.update({
-            f"{prefix}.input_layernorm.weight": f"decoder.layers.{i}.self_attn_layer_norm.weight",
-            f"{prefix}.self_attn.q_proj.weight": f"decoder.layers.{i}.self_attn.q_proj.weight",
-            f"{prefix}.self_attn.k_proj.weight": f"decoder.layers.{i}.self_attn.k_proj.weight",
-            f"{prefix}.self_attn.v_proj.weight": f"decoder.layers.{i}.self_attn.v_proj.weight",
-            f"{prefix}.self_attn.o_proj.weight": f"decoder.layers.{i}.self_attn.out_proj.weight",
-            f"{prefix}.self_attn.q_norm.weight": f"decoder.layers.{i}.self_attn.q_norm.weight",
-            f"{prefix}.self_attn.k_norm.weight": f"decoder.layers.{i}.self_attn.k_norm.weight",
-            f"{prefix}.post_attention_layernorm.weight": f"decoder.layers.{i}.final_layer_norm.weight",
-            # Qwen3 uses SwiGLU: gate_proj and up_proj, no bias, down_proj
-            f"{prefix}.mlp.gate_proj.weight": f"decoder.layers.{i}.fc1.weight",
-            f"{prefix}.mlp.up_proj.weight": f"decoder.layers.{i}.fc2.weight",
-            f"{prefix}.mlp.down_proj.weight": f"decoder.layers.{i}.fc3.weight",
-        })
-    
-    # Convert and save each tensor
-    saved_count = 0
-    for key, tensor in tensors.items():
-        # Keep Qwen3 weights in fp16 for inference consistency and lower memory
-        if tensor.dtype == torch.bfloat16:
-            tensor = tensor.to(torch.float16)
-
-        # Map to OPT-style name
-        opt_name = weight_mapping.get(key)
-        if opt_name is None:
-            # Skip tensors we don't consume (e.g. rotary_emb.inv_freq, etc.)
-            continue
-
-        # Skip tensors that are not used in current code
-        if opt_name.endswith(".bias"):
-            continue
-
-        # Convert to numpy
-        np_tensor = tensor.numpy()
-
-        # Save as numpy file (without .npy extension)
-        np_path = os.path.join(np_output_dir, opt_name)
-        os.makedirs(os.path.dirname(np_path), exist_ok=True)
-        with open(np_path, "wb") as f:
-            np.save(f, np_tensor)
-        saved_count += 1
-
-        if saved_count % 50 == 0:
-            print(f"  Progress: {saved_count}/{len(tensors)} tensors saved...")
-
-    print(f"Conversion completed! Saved {saved_count} tensors to {np_output_dir}")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str)
-    parser.add_argument("--path", type=str, default="~/opt_weights")
-    args = parser.parse_args()
-
-    download_opt_weights(args.model, args.path)
-
